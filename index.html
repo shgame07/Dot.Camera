@@ -67,7 +67,9 @@ p.lead{margin:0 0 24px;font-size:14px;line-height:1.7;color:#555;text-align:cent
   <div class="view" id="res-view"><img id="res-img" alt="完成した写真"></div>
   <div class="row">
     <button class="btn pri" id="save">保存</button>
+    <button class="btn hide" id="share">共有</button>
     <button class="btn" id="again">もう一度撮影</button>
+    <button class="btn" id="home">ホームに戻る</button>
   </div>
   <p class="note" id="save-note"></p>
 </section>
@@ -84,7 +86,7 @@ var MODES={
   chaos:{n:"CHAOS",w:32,h:24,c:8,lv:[2,2,2]}
 };
 var $=function(id){return document.getElementById(id)};
-var VERSION="1.01",infoKey="";
+var VERSION="1.06",infoKey="";
 var mode=null,stream=null,facing="environment",mirror=false,raf=0,lastT=0,blob=null,url="";
 var vid=$("vid"),prev=$("prev"),pctx=prev.getContext("2d",{willReadFrequently:true});
 
@@ -273,15 +275,39 @@ function reduce(im,n){
 /* 撮影(v1.01: 複数フレーム合成 → 面積平均縮小 → 自動補正 → 減色) */
 var working=false;
 function grab(ctx,W,H,K,gap,done){
-  var acc=new Float32Array(W*H*3),n=0,cnt=0;
+  var frames=[],cnt=0;
   (function step(){
-    if(drawFrame(ctx,W,H)){
-      var d=ctx.getImageData(0,0,W,H).data;
-      for(var i=0,j=0;i<d.length;i+=4,j+=3){acc[j]+=d[i];acc[j+1]+=d[i+1];acc[j+2]+=d[i+2]}
-      n++;
-    }
-    if(++cnt<K)setTimeout(step,gap);else done(acc,n);
+    if(drawFrame(ctx,W,H))frames.push(ctx.getImageData(0,0,W,H).data);
+    if(++cnt<K)setTimeout(step,gap);else done(frames);
   })();
+}
+/* 鮮明度(隣接画素の差の二乗和)。ブレた枚数ほど小さくなる */
+function sharpness(d,W,H){
+  var s=0,x,y,i,a,b,l0,l1,l2;
+  for(y=0;y<H-1;y+=2){
+    for(x=0;x<W-1;x+=2){
+      i=(y*W+x)*4;a=i+4;b=((y+1)*W+x)*4;
+      l0=d[i]+d[i+1]*2+d[i+2];l1=d[a]+d[a+1]*2+d[a+2];l2=d[b]+d[b+1]*2+d[b+2];
+      s+=(l0-l1)*(l0-l1)+(l0-l2)*(l0-l2);
+    }
+  }
+  return s;
+}
+/* 一番シャープな1枚を基準に、近い色の画素だけを平均(ブレ・動きの部分は基準のみ) */
+function mergeFrames(frames,W,H){
+  var N=W*H,best=0,bs=-1,f,sc,i,j,d;
+  for(f=0;f<frames.length;f++){sc=sharpness(frames[f],W,H);if(sc>bs){bs=sc;best=f}}
+  var ref=frames[best],out=new Float32Array(N*3),r0,g0,b0,sr,sg,sb,c;
+  for(i=0;i<N;i++){
+    j=i*4;r0=ref[j];g0=ref[j+1];b0=ref[j+2];sr=0;sg=0;sb=0;c=0;
+    for(f=0;f<frames.length;f++){
+      d=frames[f];
+      if(f!==best&&Math.abs(d[j]-r0)+Math.abs(d[j+1]-g0)+Math.abs(d[j+2]-b0)>64)continue;
+      sr+=d[j];sg+=d[j+1];sb+=d[j+2];c++;
+    }
+    out[i*3]=sr/c;out[i*3+1]=sg/c;out[i*3+2]=sb/c;
+  }
+  return out;
 }
 function boxDown(acc,n,W,H,S,w,h){
   var out=new Float32Array(w*h*3),norm=1/(n*S*S),x,y,o,s;
@@ -342,12 +368,12 @@ function capture(){
   $("busy").textContent="撮影中… 動かさないでください";
   busy(true);
   var t0=Date.now();
-  grab(wctx,W,H,8,120,function(acc,n){
-    if(!n){fail();return}
+  grab(wctx,W,H,8,100,function(frames){
+    if(!frames.length){fail();return}
     $("busy").textContent="仕上げ中…";
     later(function(){
       try{
-        var f=enhance(boxDown(acc,n,W,H,S,w,h),w,h);
+        var f=enhance(boxDown(mergeFrames(frames,W,H),1,W,H,S,w,h),w,h);
         var cv=document.createElement("canvas");cv.width=w;cv.height=h;
         var ctx=cv.getContext("2d");
         var im=ctx.createImageData(w,h),p=im.data,i;
@@ -364,6 +390,9 @@ function capture(){
             $("res-img").src=url;
             $("res-err").classList.remove("on");
             $("save-note").textContent=mode.n+"　"+w+"×"+h+" ／ 最大"+mode.c+"色　PNG";
+            var cs=false;
+            try{cs=!!(navigator.canShare&&navigator.canShare({files:[new File([b],"dot.png",{type:"image/png"})]}))}catch(e){}
+            $("share").classList.toggle("hide",!cs);
             stopCam();busy(false);working=false;show("s-res");
           },Math.max(0,1500-(Date.now()-t0)));
         },"image/png");
@@ -398,7 +427,17 @@ $("back").onclick=function(){stopCam();show("s-mode")};
 $("flip").onclick=function(){facing=facing==="environment"?"user":"environment";startCam()};
 $("shot").onclick=capture;
 $("save").onclick=save;
+$("share").onclick=function(){
+  if(!blob)return;
+  var er=$("res-err");
+  function ng(){er.textContent="共有に失敗しました。「保存」をお試しください。";er.classList.add("on")}
+  try{
+    var f=new File([blob],"dot-camera-"+mode.n.toLowerCase()+".png",{type:"image/png"});
+    navigator.share({files:[f]}).catch(function(e){if(!e||e.name!=="AbortError")ng()});
+  }catch(e){ng()}
+};
 $("again").onclick=function(){show("s-cam");startCam()};
+$("home").onclick=function(){stopCam();show("s-mode")};
 })();
 </script>
 </body>
