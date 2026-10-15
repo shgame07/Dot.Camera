@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>DOT CAMERA</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#fff;color:#222;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif}
+body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+.screen{display:none;min-height:100%;flex-direction:column;align-items:center;padding:20px 16px;max-width:560px;margin:0 auto}
+.screen.on{display:flex}
+h1{font-size:28px;letter-spacing:.12em;margin:24px 0 8px;color:#111}
+p.lead{margin:0 0 24px;font-size:14px;line-height:1.7;color:#555;text-align:center}
+.cards{width:100%;display:grid;gap:12px}
+.card{width:100%;text-align:left;background:#fff;border:2px solid #222;border-radius:10px;padding:16px;font:inherit;color:inherit;cursor:pointer}
+.card:active{background:#eee}
+.card b{display:block;font-size:18px;letter-spacing:.08em}
+.card span{font-size:13px;color:#555}
+.btn{width:100%;min-height:56px;border:2px solid #222;border-radius:10px;background:#fff;color:#222;font:inherit;font-size:17px;font-weight:600;cursor:pointer}
+.btn.pri{background:#222;color:#fff}
+.btn:active{opacity:.7}
+.btn.sm{width:auto;min-height:44px;padding:0 16px;font-size:14px}
+.bar{width:100%;display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px}
+.mname{font-weight:700;letter-spacing:.08em;font-size:15px}
+.view{width:100%;background:#eee;border:2px solid #222;display:flex;justify-content:center}
+.view canvas,.view img{width:100%;height:auto;display:block;image-rendering:pixelated;image-rendering:crisp-edges}
+.shutter{margin:24px 0 8px;width:80px;height:80px;border-radius:50%;border:4px solid #222;background:#fff;padding:0;cursor:pointer;position:relative}
+.shutter::after{content:"";position:absolute;inset:8px;border-radius:50%;background:#222}
+.shutter:active::after{inset:12px}
+.row{width:100%;display:grid;gap:12px;margin-top:20px}
+.note{font-size:12px;color:#666;line-height:1.6;text-align:center;margin-top:12px}
+.err{width:100%;border:2px solid #222;border-radius:10px;padding:14px;margin:0 0 14px;font-size:14px;line-height:1.7;display:none;white-space:pre-line}
+.err.on{display:block}
+#busy{position:fixed;inset:0;background:rgba(255,255,255,.85);display:none;align-items:center;justify-content:center;font-size:16px;letter-spacing:.1em;z-index:9}
+#busy.on{display:flex}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+
+<section id="s-mode" class="screen on">
+  <h1>DOT CAMERA</h1>
+  <p class="lead">あえて画素数と色数を減らして撮る、ドット絵カメラ。<br>モードを選んで撮影しよう。</p>
+  <div class="cards" id="cards"></div>
+</section>
+
+<section id="s-cam" class="screen">
+  <div class="bar">
+    <button class="btn sm" id="back">← 戻る</button>
+    <span class="mname" id="cam-name"></span>
+    <button class="btn sm hide" id="flip">切替</button>
+  </div>
+  <div class="err" id="cam-err"></div>
+  <div class="view" id="cam-view"><canvas id="prev"></canvas></div>
+  <button class="shutter" id="shot" aria-label="撮影"></button>
+  <video id="vid" playsinline muted class="hide"></video>
+</section>
+
+<section id="s-res" class="screen">
+  <h1 style="font-size:20px">完成</h1>
+  <div class="err" id="res-err"></div>
+  <div class="view" id="res-view"><img id="res-img" alt="完成した写真"></div>
+  <div class="row">
+    <button class="btn pri" id="save">保存</button>
+    <button class="btn" id="again">もう一度撮影</button>
+  </div>
+  <p class="note" id="save-note"></p>
+</section>
+
+<div id="busy">処理中…</div>
+
+<script>
+(function(){
+"use strict";
+var MODES={
+  standard:{n:"STANDARD",w:320,h:240,c:256,lv:[8,8,4]},
+  low:{n:"LOW",w:160,h:120,c:64,lv:[4,4,4]},
+  extreme:{n:"EXTREME",w:80,h:60,c:16,lv:[4,2,2]},
+  chaos:{n:"CHAOS",w:32,h:24,c:8,lv:[2,2,2]}
+};
+var $=function(id){return document.getElementById(id)};
+var mode=null,stream=null,facing="environment",mirror=false,raf=0,lastT=0,blob=null,url="";
+var vid=$("vid"),prev=$("prev"),pctx=prev.getContext("2d",{willReadFrequently:true});
+
+function show(id){
+  ["s-mode","s-cam","s-res"].forEach(function(s){$(s).classList.toggle("on",s===id)});
+  window.scrollTo(0,0);
+}
+function busy(on){$("busy").classList.toggle("on",on)}
+function later(fn){requestAnimationFrame(function(){setTimeout(fn,30)})}
+
+/* モードカード */
+Object.keys(MODES).forEach(function(k){
+  var m=MODES[k],b=document.createElement("button");
+  b.className="card";
+  b.innerHTML="<b>"+m.n+"</b><span>"+m.w+"×"+m.h+" ／ 最大"+m.c+"色</span>";
+  b.onclick=function(){mode=m;$("cam-name").textContent=m.n;show("s-cam");startCam()};
+  $("cards").appendChild(b);
+});
+
+/* 出力サイズ(画面が縦向きなら縦横を入れ替える) */
+function dims(){
+  var p=window.innerHeight>window.innerWidth;
+  return p?[mode.h,mode.w]:[mode.w,mode.h];
+}
+function drawFrame(ctx,w,h){
+  var vw=vid.videoWidth,vh=vid.videoHeight;
+  if(!vw||!vh)return false;
+  var ar=w/h,sw=vw,sh=vw/ar;
+  if(sh>vh){sh=vh;sw=vh*ar}
+  var sx=(vw-sw)/2,sy=(vh-sh)/2;
+  ctx.save();
+  if(mirror){ctx.translate(w,0);ctx.scale(-1,1)}
+  ctx.imageSmoothingEnabled=true;
+  ctx.drawImage(vid,sx,sy,sw,sh,0,0,w,h);
+  ctx.restore();
+  return true;
+}
+
+/* カメラ */
+function camError(e){
+  var t="";
+  if(!window.isSecureContext||!navigator.mediaDevices){
+    t="カメラを使うにはHTTPS接続が必要です。\nhttps:// から始まるURLで開いてください。";
+  }else if(e&&e.name==="NotAllowedError"){
+    t="カメラの使用が許可されていません。\nブラウザのアドレスバー付近、または端末の設定からこのサイトのカメラを「許可」にして、再試行してください。";
+  }else if(e&&(e.name==="NotFoundError"||e.name==="OverconstrainedError")){
+    t="カメラが見つかりません。\nカメラ付きの端末で開いているか、他のアプリがカメラを使用していないか確認してください。";
+  }else if(e&&(e.name==="NotReadableError"||e.name==="AbortError")){
+    t="カメラを起動できません。\n他のアプリやタブがカメラを使用中の可能性があります。閉じてから再試行してください。";
+  }else{
+    t="カメラの取得に失敗しました。\nページを再読み込みして再試行してください。";
+  }
+  var el=$("cam-err");
+  el.innerHTML="";
+  el.appendChild(document.createTextNode(t));
+  var r=document.createElement("button");
+  r.className="btn sm";r.textContent="再試行";r.style.marginTop="10px";r.style.display="block";
+  r.onclick=startCam;
+  el.appendChild(r);
+  el.classList.add("on");
+  $("cam-view").classList.add("hide");$("shot").classList.add("hide");
+}
+function stopCam(){
+  cancelAnimationFrame(raf);raf=0;
+  if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}
+  vid.srcObject=null;
+}
+function startCam(){
+  stopCam();
+  $("cam-err").classList.remove("on");
+  $("cam-view").classList.remove("hide");$("shot").classList.remove("hide");
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){camError(null);return}
+  busy(true);
+  navigator.mediaDevices.getUserMedia({
+    video:{facingMode:{ideal:facing},width:{ideal:1280},height:{ideal:720}},audio:false
+  }).then(function(s){
+    stream=s;
+    var st=s.getVideoTracks()[0].getSettings();
+    mirror=st.facingMode?st.facingMode==="user":facing==="user";
+    vid.srcObject=s;
+    return vid.play();
+  }).then(function(){
+    busy(false);
+    navigator.mediaDevices.enumerateDevices().then(function(ds){
+      var n=ds.filter(function(d){return d.kind==="videoinput"}).length;
+      $("flip").classList.toggle("hide",n<2);
+    }).catch(function(){});
+    loop(0);
+  }).catch(function(e){busy(false);camError(e)});
+}
+function loop(t){
+  raf=requestAnimationFrame(loop);
+  if(t-lastT<66)return;
+  lastT=t;
+  var d=dims(),w=d[0],h=d[1];
+  if(prev.width!==w||prev.height!==h){prev.width=w;prev.height=h}
+  if(!drawFrame(pctx,w,h))return;
+  var im=pctx.getImageData(0,0,w,h),p=im.data,lv=mode.lv,i,k,v;
+  for(i=0;i<p.length;i+=4){
+    for(k=0;k<3;k++){
+      v=lv[k]-1;
+      p[i+k]=Math.round(p[i+k]/255*v)*255/v;
+    }
+  }
+  pctx.putImageData(im,0,0);
+}
+
+/* 減色(メディアンカット)＋ディザリング(Floyd–Steinberg) */
+function mkBox(idx,d){
+  var mn=[255,255,255],mx=[0,0,0],i,k,j,v;
+  for(i=0;i<idx.length;i++){
+    j=idx[i]*4;
+    for(k=0;k<3;k++){v=d[j+k];if(v<mn[k])mn[k]=v;if(v>mx[k])mx[k]=v}
+  }
+  var ch=0,r=mx[0]-mn[0];
+  for(k=1;k<3;k++){if(mx[k]-mn[k]>r){r=mx[k]-mn[k];ch=k}}
+  return{idx:idx,ch:ch,r:r};
+}
+function makePalette(d,n){
+  var N=d.length/4,all=new Uint32Array(N),i;
+  for(i=0;i<N;i++)all[i]=i;
+  var boxes=[mkBox(all,d)];
+  while(boxes.length<n){
+    var bi=-1,bs=0;
+    for(i=0;i<boxes.length;i++){
+      var b=boxes[i];
+      if(b.idx.length>1&&b.r>0){var s=b.r*Math.sqrt(b.idx.length);if(s>bs){bs=s;bi=i}}
+    }
+    if(bi<0)break;
+    var bx=boxes[bi],ch=bx.ch;
+    bx.idx.sort(function(a,c){return d[a*4+ch]-d[c*4+ch]});
+    var mid=bx.idx.length>>1;
+    boxes.splice(bi,1,mkBox(bx.idx.subarray(0,mid),d),mkBox(bx.idx.subarray(mid),d));
+  }
+  var pal=new Float32Array(boxes.length*3);
+  boxes.forEach(function(b,bi){
+    var r=0,g=0,bl=0,j;
+    for(var q=0;q<b.idx.length;q++){j=b.idx[q]*4;r+=d[j];g+=d[j+1];bl+=d[j+2]}
+    var c=b.idx.length||1;
+    pal[bi*3]=r/c;pal[bi*3+1]=g/c;pal[bi*3+2]=bl/c;
+  });
+  return pal;
+}
+function reduce(im,n){
+  var d=im.data,w=im.width,h=im.height,pal=makePalette(d,n),pn=pal.length/3;
+  var buf=new Float32Array(w*h*3),i,x,y;
+  for(i=0;i<w*h;i++){buf[i*3]=d[i*4];buf[i*3+1]=d[i*4+1];buf[i*3+2]=d[i*4+2]}
+  function spread(xx,yy,f,er,eg,eb){
+    if(xx<0||xx>=w||yy>=h)return;
+    var j=(yy*w+xx)*3;
+    buf[j]+=er*f;buf[j+1]+=eg*f;buf[j+2]+=eb*f;
+  }
+  for(y=0;y<h;y++){
+    for(x=0;x<w;x++){
+      i=(y*w+x)*3;
+      var r=Math.max(0,Math.min(255,buf[i])),g=Math.max(0,Math.min(255,buf[i+1])),b=Math.max(0,Math.min(255,buf[i+2]));
+      var best=0,bd=1e12;
+      for(var p=0;p<pn;p++){
+        var dr=r-pal[p*3],dg=g-pal[p*3+1],db=b-pal[p*3+2],dd=dr*dr+dg*dg+db*db;
+        if(dd<bd){bd=dd;best=p}
+      }
+      var nr=pal[best*3],ng=pal[best*3+1],nb=pal[best*3+2],o=(y*w+x)*4;
+      d[o]=nr;d[o+1]=ng;d[o+2]=nb;d[o+3]=255;
+      var er=r-nr,eg=g-ng,eb=b-nb;
+      spread(x+1,y,7/16,er,eg,eb);
+      spread(x-1,y+1,3/16,er,eg,eb);
+      spread(x,y+1,5/16,er,eg,eb);
+      spread(x+1,y+1,1/16,er,eg,eb);
+    }
+  }
+  return im;
+}
+
+/* 撮影 */
+function capture(){
+  if(!stream)return;
+  var d=dims(),w=d[0],h=d[1];
+  var cv=document.createElement("canvas");cv.width=w;cv.height=h;
+  var ctx=cv.getContext("2d",{willReadFrequently:true});
+  if(!drawFrame(ctx,w,h))return;
+  var snap=ctx.getImageData(0,0,w,h);
+  cancelAnimationFrame(raf);raf=0;
+  busy(true);
+  later(function(){
+    try{
+      ctx.putImageData(reduce(snap,mode.c),0,0);
+      cv.toBlob(function(b){
+        if(!b){fail();return}
+        blob=b;
+        if(url)URL.revokeObjectURL(url);
+        url=URL.createObjectURL(b);
+        $("res-img").src=url;
+        $("res-err").classList.remove("on");
+        $("save-note").textContent=mode.n+"　"+w+"×"+h+" ／ 最大"+mode.c+"色　PNG";
+        stopCam();busy(false);show("s-res");
+      },"image/png");
+    }catch(e){fail()}
+  });
+}
+function fail(){
+  busy(false);
+  loop(0);
+  var el=$("cam-err");
+  el.textContent="撮影または画像の加工に失敗しました。もう一度撮影してください。";
+  el.classList.add("on");
+}
+
+/* 保存 */
+function save(){
+  if(!blob)return;
+  try{
+    var a=document.createElement("a");
+    a.href=url;a.download="dot-camera-"+mode.n.toLowerCase()+"-"+Date.now()+".png";
+    document.body.appendChild(a);a.click();a.remove();
+    $("save-note").textContent="保存されない場合は、画像を長押しして「写真に追加」「画像を保存」を選んでください。";
+  }catch(e){
+    var er=$("res-err");
+    er.textContent="保存に失敗しました。もう一度「保存」を押すか、画像を長押しして保存してください。";
+    er.classList.add("on");
+  }
+}
+
+$("back").onclick=function(){stopCam();show("s-mode")};
+$("flip").onclick=function(){facing=facing==="environment"?"user":"environment";startCam()};
+$("shot").onclick=capture;
+$("save").onclick=save;
+$("again").onclick=function(){show("s-cam");startCam()};
+})();
+</script>
+</body>
+</html>
